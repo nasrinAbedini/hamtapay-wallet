@@ -9,14 +9,17 @@ import {
   UnauthorizedException,
 } from "@nestjs/common";
 import { ApiHeader, ApiProperty, ApiTags } from "@nestjs/swagger";
-import { IsIn, IsString, IsUUID, Matches } from "class-validator";
+import { IsIn, IsNotEmpty, IsString, IsUUID, Matches } from "class-validator";
 import { WithdrawalService } from "./withdrawal.service";
 import { ApiError } from "../common/errors";
 class WithdrawalDto {
   @ApiProperty({ format: "uuid" })
   @IsUUID()
   userId!: string;
-  @ApiProperty({ enum: ["IRR"], description: "IRR withdrawals only in this version" })
+  @ApiProperty({
+    enum: ["IRR"],
+    description: "IRR withdrawals only in this version",
+  })
   @IsIn(["IRR"])
   currency!: "IRR";
   @ApiProperty({
@@ -44,6 +47,8 @@ class AdjustmentDto {
   amount!: string;
   @ApiProperty()
   @IsString()
+  @IsNotEmpty()
+  @Matches(/\S/, { message: "reason must not be blank" })
   reason!: string;
 }
 @ApiTags("withdrawals")
@@ -88,11 +93,8 @@ export class WithdrawalController {
   adjustment(
     @Body() dto: AdjustmentDto,
     @Headers("idempotency-key") key?: string,
-    @Headers("authorization") auth?: string,
-    @Headers("x-manager-id") actor?: string,
   ) {
-    this.manager(auth, actor);
-    return this.serviceAdjustment(dto, actor!, key);
+    return this.service.adjustment(dto, key);
   }
   private manager(auth?: string, actor?: string) {
     if (
@@ -105,9 +107,6 @@ export class WithdrawalController {
         code: "MANAGER_AUTH_REQUIRED",
         message: "Manager credentials required",
       });
-  }
-  private serviceAdjustment(dto: AdjustmentDto, actor: string, key?: string) {
-    return this.service.adjustment(dto, actor, key);
   }
 }
 function isUuid(v: string) {

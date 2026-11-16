@@ -76,9 +76,10 @@ export class WithdrawalService {
     if (!r[0]) throw new ApiError("NOT_FOUND", 404);
     return r[0];
   }
-  adjustment(dto: any, actor: string, key?: string) {
+  adjustment(dto: any, key?: string) {
     return this.idem.run("POST:/internal/adjustments", key, dto, async () => {
       const value = amount(dto.amount, dto.currency);
+      const adjustmentId = require("node:crypto").randomUUID();
       await this.db.transaction(async (m) => {
         const w = await this.wallets.ensure(m, dto.userId, dto.currency);
         await m.query(
@@ -101,15 +102,16 @@ export class WithdrawalService {
               side: "CREDIT",
             },
           ],
-          referenceType: "MANUAL_ADJUSTMENT",
-          referenceId: require("node:crypto").randomUUID(),
+          referenceType: "ADJUSTMENT",
+          referenceId: adjustmentId,
           userId: dto.userId,
-          createdByType: "MANAGER",
-          createdById: actor,
+          createdByType: "SYSTEM",
+          createdById: null,
           description: dto.reason,
         });
       });
       return {
+        adjustmentId,
         status: "SUCCEEDED",
         userId: dto.userId,
         currency: dto.currency,
