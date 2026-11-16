@@ -120,10 +120,14 @@ export class WithdrawalService {
     });
   }
   async process(id: string) {
-    const claimed = await this.db.query(
+    const claimedResult = await this.db.query(
       `UPDATE withdrawals SET status='PROCESSING',updated_at=now() WHERE id=$1 AND (status IN ('PENDING','UNKNOWN') OR (status='PROCESSING' AND updated_at < now()-interval '2 minutes')) RETURNING *`,
       [id],
     );
+    const claimed = Array.isArray(claimedResult[0])
+      ? claimedResult[0]
+      : claimedResult;
+
     if (!claimed.length) return this.get(id);
     const w = claimed[0];
     try {
