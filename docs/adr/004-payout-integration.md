@@ -1,18 +1,41 @@
-# ADR 004: Payout integration
+# ADR 004: نحوه ارتباط با سرویس برداشت (Payout Integration)
 
-## Context
-Payout calls cannot be part of the PostgreSQL transaction, and timeout does not prove failure.
+## مسئله (Context)
 
-## Options considered
-- Call payout inside the wallet transaction.
-- Commit reservation, then call provider.
-- Use a transactional outbox.
+در فرآیند برداشت، باید با یک سرویس پرداخت خارجی ارتباط داشته باشیم. از اونجایی که این ارتباط خارج از کنترل دیتابیس ماست، نمی‌تونیم فراخوانی سرویس Payout رو بخشی از Transaction دیتابیس در نظر بگیریم.
 
-## Decision
-Commit a reservation and stable provider request ID first, then call payout. Unknown outcomes retain reserved funds. Provide manager-protected verification and recovery endpoints.
+نکته مهم دیگه اینه که اگر هنگام ارتباط با سرویس پرداخت Timeout اتفاق بیفته، لزوماً به معنی ناموفق بودن برداشت نیست؛ ممکنه سرویس درخواست رو دریافت و پردازش کرده باشه، اما پاسخ به ما نرسیده باشه.
 
-## Reasons
-This avoids holding database locks over network calls while allowing safe retries using the same provider request ID.
+## راهکارهای بررسی‌شده (Options Considered)
 
-## Trade-offs
-A process can stop between commit and provider call. The recovery endpoint must be scheduled or invoked operationally. Provider idempotency semantics remain unverified until simulator documentation is available.
+سه راهکار رو بررسی کردم:
+
+- فراخوانی سرویس Payout داخل Transaction کیف پول.
+- ابتدا رزرو مبلغ در دیتابیس و ثبت اطلاعات درخواست، سپس فراخوانی سرویس پرداخت.
+- استفاده از الگوی Transactional Outbox برای مدیریت مطمئن‌تر ارسال درخواست‌ها.
+
+## تصمیم نهایی (Decision)
+
+تصمیم گرفتم ابتدا مبلغ برداشت رو در کیف پول رزرو کنم و یک شناسه ثابت برای درخواست به سرویس پرداخت اختصاص بدم.
+
+بعد از Commit شدن Transaction دیتابیس، درخواست رو برای سرویس Payout ارسال می‌کنم.
+
+اگر نتیجه درخواست نامشخص باشه، مثلاً به دلیل Timeout، مبلغ رو آزاد نمی‌کنم و در وضعیت رزرو نگه می‌دارم تا نتیجه واقعی تراکنش مشخص بشه.
+
+همچنین برای بررسی وضعیت و بازیابی درخواست‌های نامشخص، Endpointهایی در نظر گرفتم که فقط از طریق Manager قابل دسترسی هستن.
+
+## دلایل انتخاب (Reasons)
+
+با این روش، هنگام ارتباط با سرویس خارجی، قفل‌های دیتابیس رو باز نگه نمی‌دارم و Transaction طولانی ایجاد نمی‌کنم.
+
+از طرف دیگه، چون شناسه درخواست Payout ثابته، می‌تونم برای پیگیری یا تلاش مجدد از همون شناسه استفاده کنم و از ایجاد درخواست برداشت تکراری جلوگیری کنم؛ البته به شرطی که سرویس پرداخت هم Idempotency رو به‌درستی پشتیبانی کنه.
+
+## محدودیت‌ها و هزینه‌ها (Trade-offs)
+
+یکی از محدودیت‌های این روش اینه که ممکنه برنامه بعد از Commit شدن اطلاعات رزرو و قبل از ارسال درخواست به سرویس Payout متوقف بشه.
+
+در این شرایط، درخواست در دیتابیس ثبت شده اما هنوز به سرویس خارجی ارسال نشده.
+
+برای حل این مسئله، باید مکانیزم بازیابی داشته باشیم تا درخواست‌های باقی‌مانده رو شناسایی و دوباره پردازش کنیم. در طراحی فعلی، این کار از طریق Endpoint بازیابی انجام می‌شه و اجرای اون نیاز به پیگیری عملیاتی یا زمان‌بندی مشخص داره.
+
+همچنین هنوز مستندات شبیه‌ساز برای تأیید رفتار Idempotency سرویس Payout در دسترس نیست؛ بنابراین نمی‌تونم با قطعیت بگم که ارسال مجدد درخواست با همان شناسه، در سمت سرویس پرداخت حتماً از اجرای تکراری جلوگیری می‌کنه.

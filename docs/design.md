@@ -19,7 +19,6 @@
 - Backend: NestJS + TypeScript
 - Database: PostgreSQL
 - Architecture: Modular Monolith
-- API Documentation: Swagger / OpenAPI
 - Testing: Integration Test با PostgreSQL واقعی
 
 ---
@@ -377,7 +376,7 @@ UNIQUE (scope, key)
 
 سپس موجودی قابل استفاده کیف پول افزایش پیدا می‌کند.
 
-## ۵.۲ شارژ دستی توسط مدیر
+## ۵.۲ تعدیل دستی موجودی
 
 API:
 
@@ -401,7 +400,7 @@ POST /internal/adjustments
 1. کیف پول کاربر قفل می‌شود.
 2. موجودی افزایش پیدا می‌کند.
 3. دو Entry در Ledger ثبت می‌شود.
-4. اطلاعات مدیر و دلیل عملیات در Ledger ذخیره می‌شود.
+4. دلیل عملیات در Ledger ذخیره می‌شود. این endpoint بدون احراز هویت است؛ به همین دلیل actor به‌صورت SYSTEM و بدون شناسه ثبت می‌شود.
 
 نمونه Ledger:
 
@@ -761,40 +760,3 @@ SUCCEEDED           FAILED
 این موارد می‌توانند در نسخه‌های بعدی اضافه شوند.
 
 ---
-
-# ۱۱. اولویت پیاده‌سازی
-
-با توجه به محدودیت زمانی دو روزه، ترتیب پیاده‌سازی به شکل زیر خواهد بود:
-
-1. ایجاد پروژه NestJS و اتصال PostgreSQL
-2. ایجاد Migrationها و جداول اصلی
-3. پیاده‌سازی Wallet
-4. پیاده‌سازی Ledger
-5. پیاده‌سازی شارژ دستی توسط مدیر
-6. پیاده‌سازی شارژ از طریق PSP
-7. پیاده‌سازی برداشت و کنترل سقف روزانه
-8. پیاده‌سازی Idempotency
-9. نوشتن Integration Test برای شارژ و برداشت
-10. تست هم‌زمانی برداشت و جلوگیری از منفی شدن موجودی
-11. مستندسازی API با Swagger
-12. تکمیل README و ثبت Commitهای نهایی
-
-**معیار اصلی موفقیت:** هیچ عملیات مالی نباید باعث گم شدن پول، ثبت دوباره تراکنش یا ایجاد موجودی منفی شود.
-
----
-
-## وضعیت پیاده‌سازی و اصلاح فرضیات
-
-این بخش مرجع پیاده‌سازی فعلی است و اختلاف‌های متن بالا را روشن می‌کند:
-
-- تعداد جدول‌های اصلی پنج مورد است، نه شش: `wallets`، `ledger_entries`، `payments`، `withdrawals` و `idempotency_keys`.
-- ارز ریالی در API با کد `IRR` و مبلغ صحیح بر حسب تومان نمایش داده می‌شود. اعداد اعشاری فقط برای `USDT` مجازند؛ برداشت این نسخه فقط IRR است.
-- schema فقط از migration نسخه‌دار ساخته می‌شود و TypeORM synchronization خاموش است. trigger دیتابیس، update/delete روی ledger را رد می‌کند.
-- برای جلوگیری از تکرار مالی، درخواست concurrent با همان idempotency key پاسخ `IDEMPOTENCY_IN_PROGRESS` می‌گیرد. خطاهای HTTP نهایی نیز برای همان کلید ذخیره می‌شوند. خطای فرایندی ناشناخته ممکن است کلید را در حالت IN_PROGRESS باقی بگذارد؛ پاک‌سازی خودکار ندارد.
-- خروجی API و تاریخچه از مقادیر Decimal رشته‌ای PostgreSQL استفاده می‌کنند و محاسبات سقف و موجودی با integer arithmetic انجام می‌شوند.
-- Adapterها از قرارداد `hamtapay/t103-simulator:1.0` استفاده می‌کنند. کد داخل archive سیمولاتور بررسی شده است؛ تست زنده انجام نشده چون بارگذاری Docker در این نشست رد شد. مسیرها، codeهای تأیید PSP و webhook payout در `provider-notes.md` ثبت شده‌اند.
-- manager access در این نسخه با secret ثابت محیطی و `x-manager-id` پیاده شده است؛ سامانه احراز هویت کاربران و مدیران خارج از محدوده است.
-- برای عملیات Payout، endpointهای manager-protected بررسی وضعیت و بازیابی برداشت‌های PENDING و PROCESSING قدیمی وجود دارد. webhook امضاشده simulator در `/webhooks/payout` پذیرفته می‌شود. بازیابی باید توسط scheduler یا عملیات دستی فراخوانی شود، چون Outbox وجود ندارد.
-- وضعیت `RETURNED` از simulator پس از تسویه پشتیبانی می‌شود و با migration افزایشی به schema اضافه شده است؛ مبلغ به کیف پول Available برمی‌گردد و Ledger جبرانی ثبت می‌شود.
-- آدرس‌های داخلی callback در Compose به `app:3000/payments/psp/callback` و `app:3000/webhooks/payout` تنظیم شده‌اند. آدرس base simulator برای هر دو adapter `http://simulator:8080` است.
-- تست‌های integration به PostgreSQL واقعی نیاز دارند. تست‌های Jest در این نشست به‌دلیل نبود `TEST_DATABASE_URL` رد شدند؛ simulator image نیز به‌دلیل رد شدن درخواست Docker اجرا نشد.

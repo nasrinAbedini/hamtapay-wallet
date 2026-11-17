@@ -1,11 +1,13 @@
 import { AddressInfo } from "node:net";
 import { createHmac } from "node:crypto";
+import { createServer } from "node:http";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { INestApplication, ValidationPipe } from "@nestjs/common";
 import { RawBodyRequest } from "@nestjs/common";
 import { Request } from "express";
 import { Test } from "@nestjs/testing";
+import { ConfigService } from "@nestjs/config";
 import { DataSource } from "typeorm";
 import { InitialSchema1763000000000 } from "../src/database/migrations/1763000000000-InitialSchema";
 import { AllowReturnedWithdrawal1763100000000 } from "../src/database/migrations/1763100000000-AllowReturnedWithdrawal";
@@ -19,6 +21,7 @@ import { ApiExceptionFilter } from "../src/common/exception.filter";
 import { PayoutWebhookController } from "../src/webhooks/payout-webhook.controller";
 import { WebhookSignatureService } from "../src/webhooks/webhook-signature.service";
 import { toUnits } from "../src/common/money";
+import { validateEnvironment } from "../src/config/environment";
 
 function envFile(): Record<string, string> {
   const path = resolve(process.cwd(), ".env");
@@ -66,6 +69,10 @@ describe("financial integration (real PostgreSQL)", () => {
   let withdrawal: WithdrawalService;
   let app: INestApplication;
   let apiBase: string;
+  let originalCooldown: string | undefined;
+  let originalDailyLimit: string | undefined;
+  let originalBusinessTimezone: string | undefined;
+  let withdrawalConfig: ConfigService;
   let payouts: {
     submit: (p: any) => Promise<any>;
     status: (id: string) => Promise<any>;
@@ -99,6 +106,13 @@ describe("financial integration (real PostgreSQL)", () => {
       );
     }
     wallet = new WalletService(db);
+    originalCooldown = process.env.WITHDRAWAL_COOLDOWN_MINUTES;
+    process.env.WITHDRAWAL_COOLDOWN_MINUTES = "30";
+    originalDailyLimit = process.env.DAILY_WITHDRAWAL_LIMIT;
+    process.env.DAILY_WITHDRAWAL_LIMIT = "200000000";
+    originalBusinessTimezone = process.env.BUSINESS_TIMEZONE;
+    process.env.BUSINESS_TIMEZONE = "UTC";
+    withdrawalConfig = new ConfigService({ BUSINESS_TIMEZONE: "UTC" });
     payoutSubmit = jest.fn(async () => ({ status: "UNKNOWN" }));
     payouts = {
       submit: (payload) => payoutSubmit(payload),
@@ -110,6 +124,7 @@ describe("financial integration (real PostgreSQL)", () => {
       new LedgerService(),
       payouts as unknown as PayoutAdapter,
       new IdempotencyService(db),
+      withdrawalConfig,
     );
     const moduleRef = await Test.createTestingModule({
       controllers: [WithdrawalController],
@@ -132,6 +147,7 @@ describe("financial integration (real PostgreSQL)", () => {
   beforeEach(async () => {
     payoutSubmit.mockReset();
     payoutSubmit.mockResolvedValue({ status: "UNKNOWN" });
+    withdrawalConfig?.set("BUSINESS_TIMEZONE", "UTC");
     await db.query(
       "TRUNCATE idempotency_keys,withdrawals,payments,ledger_entries,wallets CASCADE",
     );
@@ -139,6 +155,15 @@ describe("financial integration (real PostgreSQL)", () => {
   afterAll(async () => {
     if (app) await app.close();
     if (db?.isInitialized) await db.destroy();
+    if (originalCooldown === undefined)
+      delete process.env.WITHDRAWAL_COOLDOWN_MINUTES;
+    else process.env.WITHDRAWAL_COOLDOWN_MINUTES = originalCooldown;
+    if (originalDailyLimit === undefined)
+      delete process.env.DAILY_WITHDRAWAL_LIMIT;
+    else process.env.DAILY_WITHDRAWAL_LIMIT = originalDailyLimit;
+    if (originalBusinessTimezone === undefined)
+      delete process.env.BUSINESS_TIMEZONE;
+    else process.env.BUSINESS_TIMEZONE = originalBusinessTimezone;
   });
   async function postAdjustment(body: unknown, key = "adjustment-test-key") {
     const response = await fetch(`${apiBase}/internal/adjustments`, {
@@ -229,6 +254,22 @@ describe("financial integration (real PostgreSQL)", () => {
     });
     return { response, body: await response.json() };
   }
+  async function sendPayoutWebhook(event: Record<string, unknown>) {
+    const rawBody = Buffer.from(JSON.stringify(event));
+    const signature = createHmac("sha256", process.env.WEBHOOK_SECRET!)
+      .update(rawBody)
+      .digest("hex");
+    const webhook = new PayoutWebhookController(
+      new WebhookSignatureService(),
+      new IdempotencyService(db),
+      withdrawal,
+    );
+    return webhook.payout(
+      { rawBody } as RawBodyRequest<Request>,
+      signature,
+      event.eventId as string,
+    );
+  }
   async function assertFinancialInvariants(userId: string, currency = "IRR") {
     const row = (
       await db.query(
@@ -313,43 +354,216 @@ describe("financial integration (real PostgreSQL)", () => {
   it("reserves funds during a concurrent insufficient-funds race", async () => {
     const user = "22222222-2222-4222-8222-222222222223";
     await seedWallet(user, "150000");
-    const results = await Promise.all([
-      postWithdrawal(user, "100000", "race-a"),
-      postWithdrawal(user, "100000", "race-b"),
-    ]);
-    expect(results.map((r) => r.response.status).sort()).toEqual([201, 422]);
-    const rejected = results.find((r) => r.response.status === 422);
-    expect(rejected?.body.code).toBe("INSUFFICIENT_FUNDS");
-    const row = (
-      await db.query(
-        "SELECT available_balance::text available,reserved_balance::text reserved FROM wallets WHERE user_id=$1",
-        [user],
-      )
-    )[0];
-    expect(toUnits(row.available)).toBe(50_000n * 1_000_000n);
-    expect(toUnits(row.reserved)).toBe(100_000n * 1_000_000n);
-    expect(toUnits(row.reserved)).toBeLessThanOrEqual(150_000n * 1_000_000n);
-    await assertFinancialInvariants(user);
+    const previousCooldown = process.env.WITHDRAWAL_COOLDOWN_MINUTES;
+    process.env.WITHDRAWAL_COOLDOWN_MINUTES = "0";
+    try {
+      const results = await Promise.all([
+        postWithdrawal(user, "100000", "race-a"),
+        postWithdrawal(user, "100000", "race-b"),
+      ]);
+      expect(results.map((r) => r.response.status).sort()).toEqual([201, 422]);
+      const rejected = results.find((r) => r.response.status === 422);
+      expect(rejected?.body.code).toBe("INSUFFICIENT_FUNDS");
+      const row = (
+        await db.query(
+          "SELECT available_balance::text available,reserved_balance::text reserved FROM wallets WHERE user_id=$1",
+          [user],
+        )
+      )[0];
+      expect(toUnits(row.available)).toBe(50_000n * 1_000_000n);
+      expect(toUnits(row.reserved)).toBe(100_000n * 1_000_000n);
+      expect(toUnits(row.reserved)).toBeLessThanOrEqual(150_000n * 1_000_000n);
+      await assertFinancialInvariants(user);
+    } finally {
+      if (previousCooldown === undefined)
+        delete process.env.WITHDRAWAL_COOLDOWN_MINUTES;
+      else process.env.WITHDRAWAL_COOLDOWN_MINUTES = previousCooldown;
+    }
   });
+
   it("enforces the daily limit across concurrent withdrawals", async () => {
     const user = "22222222-2222-4222-8222-222222222224";
     await seedWallet(user, "200100000");
-    const initial = await postWithdrawal(user, "199900000", "daily-initial");
-    expect(initial.response.status).toBe(201);
-    const results = await Promise.all([
-      postWithdrawal(user, "100000", "daily-a"),
-      postWithdrawal(user, "100000", "daily-b"),
-    ]);
-    expect(results.map((r) => r.response.status).sort()).toEqual([201, 422]);
-    expect(results.find((r) => r.response.status === 422)?.body.code).toBe(
-      "DAILY_LIMIT_EXCEEDED",
+
+    process.env.WITHDRAWAL_COOLDOWN_MINUTES = "0";
+
+    try {
+      const initial = await postWithdrawal(user, "199900000", "daily-initial");
+
+      expect(initial.response.status).toBe(201);
+
+      const ledgerBeforeRace = await db.query(
+        "SELECT count(*)::int count FROM ledger_entries WHERE related_user_id=$1",
+        [user],
+      );
+
+      const results = await Promise.all([
+        postWithdrawal(user, "100000", "daily-a"),
+        postWithdrawal(user, "100000", "daily-b"),
+      ]);
+
+      expect(results.map((r) => r.response.status).sort()).toEqual([201, 422]);
+
+      const rejected = results.find((r) => r.response.status === 422);
+
+      expect(rejected?.body.code).toBe("DAILY_WITHDRAWAL_LIMIT_EXCEEDED");
+
+      expect(rejected?.body.details).toMatchObject({
+        dailyLimit: "200000000",
+        amountAlreadyWithdrawn: "200000000",
+        remainingDailyAllowance: "0",
+        requestedAmount: "100000",
+        currency: "IRR",
+      });
+
+      const aggregate = await db.query(
+        `SELECT COALESCE(sum(amount), 0)::text total
+       FROM withdrawals
+       WHERE user_id = $1
+         AND currency = 'IRR'
+         AND status IN ('PENDING', 'PROCESSING', 'UNKNOWN', 'SUCCEEDED')`,
+        [user],
+      );
+
+      expect(toUnits(aggregate[0].total)).toBe(200_000_000n * 1_000_000n);
+
+      const ledgerAfterRace = await db.query(
+        "SELECT count(*)::int count FROM ledger_entries WHERE related_user_id=$1",
+        [user],
+      );
+
+      expect(ledgerAfterRace[0].count - ledgerBeforeRace[0].count).toBe(2);
+
+      await assertFinancialInvariants(user);
+    } finally {
+      process.env.WITHDRAWAL_COOLDOWN_MINUTES = "30";
+    }
+  });
+
+  it("allows requests below and exactly at the configured daily limit", async () => {
+    process.env.WITHDRAWAL_COOLDOWN_MINUTES = "0";
+    const belowUser = "22222222-2222-4222-8222-222222222241";
+    await seedWallet(belowUser, "200000");
+    expect(
+      (await postWithdrawal(belowUser, "199999", "limit-below")).response
+        .status,
+    ).toBe(201);
+    const exactUser = "22222222-2222-4222-8222-222222222242";
+    await seedWallet(exactUser, "200000000");
+    expect(
+      (await postWithdrawal(exactUser, "200000000", "limit-exact")).response
+        .status,
+    ).toBe(201);
+  });
+  it.each(["PENDING", "PROCESSING", "UNKNOWN", "SUCCEEDED"])(
+    "%s withdrawals count toward the daily allowance",
+    async (status) => {
+      process.env.WITHDRAWAL_COOLDOWN_MINUTES = "0";
+
+      const user = `33333333-3333-4333-8333-${String(
+        333333330000 +
+          ["PENDING", "PROCESSING", "UNKNOWN", "SUCCEEDED"].indexOf(status),
+      ).slice(-12)}`;
+
+      await seedWallet(user, "200000000");
+
+      await db.query(
+        `INSERT INTO withdrawals(user_id, amount, currency, destination, status)
+       VALUES($1, '200000000', 'IRR', 'test', $2)`,
+        [user, status],
+      );
+
+      const result = await postWithdrawal(user, "100000", `counts-${status}`);
+
+      expect(result.response.status).toBe(422);
+      expect(result.body.code).toBe("DAILY_WITHDRAWAL_LIMIT_EXCEEDED");
+    },
+  );
+  it.each(["FAILED", "RETURNED"])(
+    "%s withdrawals do not count toward the daily allowance",
+    async (status) => {
+      process.env.WITHDRAWAL_COOLDOWN_MINUTES = "0";
+      const user = `44444444-4444-4444-8444-${String(444444440000 + ["FAILED", "RETURNED"].indexOf(status)).slice(-12)}`;
+      await seedWallet(user, "200000");
+      await db.query(
+        "INSERT INTO withdrawals(user_id,amount,currency,destination,status) VALUES($1,'100000','IRR','test',$2)",
+        [user, status],
+      );
+      expect(
+        (await postWithdrawal(user, "200000", `excluded-${status}`)).response
+          .status,
+      ).toBe(201);
+    },
+  );
+  it.each(["UTC", "Europe/Berlin"])(
+    "uses %s calendar-day boundaries, including start and excluding next-day start",
+    async (timezone) => {
+      process.env.WITHDRAWAL_COOLDOWN_MINUTES = "0";
+      withdrawalConfig.set("BUSINESS_TIMEZONE", timezone);
+      const index = ["UTC", "Europe/Berlin"].indexOf(timezone);
+      const includedUser = `55555555-5555-4555-8555-${String(555555550000 + index * 2).slice(-12)}`;
+      await seedWallet(includedUser, "200000000");
+      await db.query(
+        `INSERT INTO withdrawals(user_id,amount,currency,destination,status,created_at)
+         VALUES($1,'100000000','IRR','test','PENDING',
+           date_trunc('day',now() AT TIME ZONE $2) AT TIME ZONE $2)`,
+        [includedUser, timezone],
+      );
+      const included = await postWithdrawal(
+        includedUser,
+        "100000001",
+        `boundary-start-${timezone}`,
+      );
+      expect(included.response.status).toBe(422);
+      expect(included.body.code).toBe("DAILY_WITHDRAWAL_LIMIT_EXCEEDED");
+
+      const excludedUser = `55555555-5555-4555-8555-${String(555555550001 + index * 2).slice(-12)}`;
+      await seedWallet(excludedUser, "200000000");
+      await db.query(
+        `INSERT INTO withdrawals(user_id,amount,currency,destination,status,created_at)
+         VALUES($1,'200000000','IRR','test','PENDING',
+           (date_trunc('day',now() AT TIME ZONE $2)+interval '1 day') AT TIME ZONE $2)`,
+        [excludedUser, timezone],
+      );
+      expect(
+        (
+          await postWithdrawal(
+            excludedUser,
+            "200000000",
+            `boundary-end-${timezone}`,
+          )
+        ).response.status,
+      ).toBe(201);
+    },
+  );
+  it("uses a 23 or 25 hour day across Berlin daylight-saving transitions", async () => {
+    const durations = await db.query(
+      `SELECT
+         extract(epoch FROM ((timestamp '2024-04-01 00:00:00' AT TIME ZONE $1) - (timestamp '2024-03-31 00:00:00' AT TIME ZONE $1)))::int spring,
+         extract(epoch FROM ((timestamp '2024-10-28 00:00:00' AT TIME ZONE $1) - (timestamp '2024-10-27 00:00:00' AT TIME ZONE $1)))::int autumn`,
+      ["Europe/Berlin"],
     );
-    const aggregate = await db.query(
-      "SELECT COALESCE(sum(amount),0)::text total FROM withdrawals WHERE user_id=$1 AND currency='IRR' AND status IN ('PENDING','PROCESSING','UNKNOWN','SUCCEEDED')",
+    expect(durations[0].spring).toBe(23 * 60 * 60);
+    expect(durations[0].autumn).toBe(25 * 60 * 60);
+  });
+  it("defaults the business timezone to UTC and rejects invalid identifiers", () => {
+    expect(validateEnvironment({}).BUSINESS_TIMEZONE).toBe("UTC");
+    expect(() =>
+      validateEnvironment({ BUSINESS_TIMEZONE: "Mars/Olympus" }),
+    ).toThrow("Invalid BUSINESS_TIMEZONE configuration");
+  });
+  it("calculates usage separately for different UTC calendar days", async () => {
+    process.env.WITHDRAWAL_COOLDOWN_MINUTES = "0";
+    withdrawalConfig.set("BUSINESS_TIMEZONE", "UTC");
+    const user = "55555555-5555-4555-8555-555555555551";
+    await seedWallet(user, "200000");
+    await db.query(
+      "INSERT INTO withdrawals(user_id,amount,currency,destination,status,created_at) VALUES($1,'200000','IRR','test','PENDING',date_trunc('day',now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' - interval '1 day')",
       [user],
     );
-    expect(toUnits(aggregate[0].total)).toBe(200_000_000n * 1_000_000n);
-    await assertFinancialInvariants(user);
+    expect(
+      (await postWithdrawal(user, "200000", "different-day")).response.status,
+    ).toBe(201);
   });
   it("settles a successful payout exactly once", async () => {
     const user = "44444444-4444-4444-8444-444444444445";
@@ -361,6 +575,7 @@ describe("financial integration (real PostgreSQL)", () => {
       "payout-success",
     );
     expect(response.status).toBe(201);
+    expect(Array.isArray(body)).toBe(false);
     expect(body.status).toBe("SUCCEEDED");
     const walletRow = (
       await db.query(
@@ -376,7 +591,7 @@ describe("financial integration (real PostgreSQL)", () => {
           "SELECT id FROM ledger_entries WHERE reference_type='WITHDRAWAL_SETTLEMENT'",
         )
       ).length,
-    ).toBe(1);
+    ).toBe(2);
     await assertFinancialInvariants(user);
   });
   it("releases reserved funds when payout definitively fails", async () => {
@@ -389,6 +604,7 @@ describe("financial integration (real PostgreSQL)", () => {
       "payout-failed",
     );
     expect(response.status).toBe(201);
+    expect(Array.isArray(body)).toBe(false);
     expect(body.status).toBe("FAILED");
     const walletRow = (
       await db.query(
@@ -404,7 +620,7 @@ describe("financial integration (real PostgreSQL)", () => {
           "SELECT id FROM ledger_entries WHERE reference_type='WITHDRAWAL_RELEASE'",
         )
       ).length,
-    ).toBe(1);
+    ).toBe(2);
     await assertFinancialInvariants(user);
   });
   it("keeps funds reserved when payout outcome is unknown", async () => {
@@ -418,6 +634,243 @@ describe("financial integration (real PostgreSQL)", () => {
     );
     expect(response.status).toBe(201);
     expect(body.status).toBe("UNKNOWN");
+    await assertFinancialInvariants(user);
+  });
+  it("reuses the persisted provider request ID when retrying an UNKNOWN withdrawal", async () => {
+    const user = "33333333-3333-4333-8333-333333333345";
+    await seedWallet(user, "200000");
+    const first = await postWithdrawal(user, "100000", "stable-provider-id");
+    expect(first.body.status).toBe("UNKNOWN");
+    const stored = (
+      await db.query(
+        "SELECT id,provider_request_id FROM withdrawals WHERE user_id=$1",
+        [user],
+      )
+    )[0];
+    payoutSubmit.mockResolvedValue({ status: "PROCESSING" });
+    await withdrawal.process(stored.id);
+    expect(payoutSubmit).toHaveBeenCalledTimes(2);
+    expect(payoutSubmit.mock.calls[1][0].requestId).toBe(
+      stored.provider_request_id,
+    );
+    expect(
+      await db.query("SELECT id FROM withdrawals WHERE user_id=$1", [user]),
+    ).toHaveLength(1);
+    await assertFinancialInvariants(user);
+  });
+  it("maps an actual payout HTTP timeout to UNKNOWN and keeps funds reserved", async () => {
+    const user = "33333333-3333-4333-8333-333333333336";
+    await seedWallet(user, "200000");
+    let received:
+      | { method: string; url: string; body: Record<string, unknown> }
+      | undefined;
+    const provider = createServer((request, _response) => {
+      const chunks: Buffer[] = [];
+      request.on("data", (chunk: Buffer) => chunks.push(chunk));
+      request.on("end", () => {
+        received = {
+          method: request.method ?? "",
+          url: request.url ?? "",
+          body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
+        };
+        // Deliberately leave the request unanswered so the adapter's own
+        // AbortController timeout is exercised.
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      provider.once("error", reject);
+      provider.listen(0, "127.0.0.1", resolve);
+    });
+    const address = provider.address() as AddressInfo;
+    const previousBaseUrl = process.env.PAYOUT_BASE_URL;
+    const previousTimeout = process.env.PROVIDER_TIMEOUT_MS;
+    process.env.PAYOUT_BASE_URL = `http://127.0.0.1:${address.port}`;
+    process.env.PROVIDER_TIMEOUT_MS = "500";
+    payoutSubmit.mockImplementation((payload) =>
+      new PayoutAdapter().submit(payload),
+    );
+    try {
+      const { response, body } = await postWithdrawal(
+        user,
+        "100000",
+        "real-adapter-timeout",
+      );
+      expect(response.status).toBe(201);
+      expect(body.status).toBe("UNKNOWN");
+      expect(received).toMatchObject({
+        method: "POST",
+        url: "/payout/transfers",
+        body: {
+          requestId: body.provider_request_id,
+          amount: "100000",
+          currency: "IRR",
+          type: "IBAN",
+        },
+      });
+      await assertFinancialInvariants(user);
+      const walletRow = (
+        await db.query(
+          "SELECT available_balance::text available,reserved_balance::text reserved FROM wallets WHERE user_id=$1",
+          [user],
+        )
+      )[0];
+      expect(walletRow.available).toBe("100000.000000");
+      expect(walletRow.reserved).toBe("100000.000000");
+    } finally {
+      provider.closeAllConnections();
+      await new Promise<void>((resolve) => provider.close(() => resolve()));
+      if (previousBaseUrl === undefined) delete process.env.PAYOUT_BASE_URL;
+      else process.env.PAYOUT_BASE_URL = previousBaseUrl;
+      if (previousTimeout === undefined) delete process.env.PROVIDER_TIMEOUT_MS;
+      else process.env.PROVIDER_TIMEOUT_MS = previousTimeout;
+    }
+  });
+  it("rejects a new IRR withdrawal while the cooldown is active", async () => {
+    const user = "33333333-3333-4333-8333-333333333337";
+    await seedWallet(user, "300000");
+    const previousCooldown = process.env.WITHDRAWAL_COOLDOWN_MINUTES;
+    process.env.WITHDRAWAL_COOLDOWN_MINUTES = "30";
+    try {
+      const first = await postWithdrawal(user, "100000", "cooldown-first");
+      expect(first.response.status).toBe(201);
+      const before = (
+        await db.query(
+          "SELECT available_balance::text available,reserved_balance::text reserved FROM wallets WHERE user_id=$1",
+          [user],
+        )
+      )[0];
+      const ledgerEntriesBefore = await db.query(
+        "SELECT id FROM ledger_entries WHERE reference_type='WITHDRAWAL_RESERVE' AND related_user_id=$1",
+        [user],
+      );
+      expect(ledgerEntriesBefore).toHaveLength(2);
+
+      const second = await postWithdrawal(user, "100000", "cooldown-second");
+      expect(second.response.status).toBe(429);
+      expect(second.body.code).toBe("WITHDRAWAL_COOLDOWN_ACTIVE");
+      expect(
+        await db.query("SELECT id FROM withdrawals WHERE user_id=$1", [user]),
+      ).toHaveLength(1);
+      expect(
+        await db.query(
+          "SELECT id FROM ledger_entries WHERE reference_type='WITHDRAWAL_RESERVE' AND related_user_id=$1",
+          [user],
+        ),
+      ).toHaveLength(ledgerEntriesBefore.length);
+      const after = (
+        await db.query(
+          "SELECT available_balance::text available,reserved_balance::text reserved FROM wallets WHERE user_id=$1",
+          [user],
+        )
+      )[0];
+      expect(after).toEqual(before);
+      expect(payoutSubmit).toHaveBeenCalledTimes(1);
+      await assertFinancialInvariants(user);
+    } finally {
+      if (previousCooldown === undefined)
+        delete process.env.WITHDRAWAL_COOLDOWN_MINUTES;
+      else process.env.WITHDRAWAL_COOLDOWN_MINUTES = previousCooldown;
+    }
+  });
+  it.each([
+    ["PENDING", "33333333-3333-4333-8333-333333333342"],
+    ["PROCESSING", "33333333-3333-4333-8333-333333333343"],
+    ["SUCCEEDED", "33333333-3333-4333-8333-333333333344"],
+  ])("cooldown includes a recent %s withdrawal", async (status, user) => {
+    process.env.WITHDRAWAL_COOLDOWN_MINUTES = "30";
+    await seedWallet(user, "300000");
+    if (status === "PROCESSING")
+      payoutSubmit.mockResolvedValue({ status: "PROCESSING" });
+    if (status === "SUCCEEDED")
+      payoutSubmit.mockResolvedValue({ status: "SUCCEEDED" });
+    const first = await postWithdrawal(user, "100000", `cooldown-${status}`);
+    expect(first.response.status).toBe(201);
+    if (status === "PENDING")
+      await db.query(
+        "UPDATE withdrawals SET status='PENDING' WHERE user_id=$1",
+        [user],
+      );
+    const second = await postWithdrawal(user, "100000", `after-${status}`);
+    expect(second.response.status).toBe(429);
+    expect(second.body.code).toBe("WITHDRAWAL_COOLDOWN_ACTIVE");
+    await assertFinancialInvariants(user);
+  });
+  it("allows a withdrawal after the configured cooldown expires", async () => {
+    const user = "33333333-3333-4333-8333-333333333338";
+    await seedWallet(user, "300000");
+    const previousCooldown = process.env.WITHDRAWAL_COOLDOWN_MINUTES;
+    process.env.WITHDRAWAL_COOLDOWN_MINUTES = "2";
+    payoutSubmit.mockResolvedValue({ status: "SUCCEEDED" });
+    try {
+      const first = await postWithdrawal(user, "100000", "cooldown-expiry-a");
+      expect(first.response.status).toBe(201);
+      await db.query(
+        "UPDATE withdrawals SET created_at=statement_timestamp()-interval '3 minutes' WHERE user_id=$1",
+        [user],
+      );
+      const second = await postWithdrawal(user, "100000", "cooldown-expiry-b");
+      expect(second.response.status).toBe(201);
+      expect(second.body.status).toBe("SUCCEEDED");
+      expect(
+        await db.query("SELECT id FROM withdrawals WHERE user_id=$1", [user]),
+      ).toHaveLength(2);
+      await assertFinancialInvariants(user);
+    } finally {
+      if (previousCooldown === undefined)
+        delete process.env.WITHDRAWAL_COOLDOWN_MINUTES;
+      else process.env.WITHDRAWAL_COOLDOWN_MINUTES = previousCooldown;
+    }
+  });
+  it("does not report an IRR cooldown for unsupported USDT withdrawals", async () => {
+    const user = "33333333-3333-4333-8333-333333333339";
+    await seedWallet(user, "200000");
+    const recent = await postWithdrawal(user, "100000", "irr-before-usdt");
+    expect(recent.response.status).toBe(201);
+    const unsupported = withdrawal.create(
+      {
+        userId: user,
+        amount: "100000",
+        currency: "USDT",
+        destination: "IR490000000000000000000000",
+      },
+      "unsupported-usdt",
+    );
+    await expect(unsupported).rejects.toMatchObject({
+      response: { code: "UNSUPPORTED_WITHDRAWAL_CURRENCY" },
+    });
+  });
+  it("allows a new withdrawal after a prior payout definitively failed", async () => {
+    const user = "33333333-3333-4333-8333-333333333340";
+    await seedWallet(user, "200000");
+    payoutSubmit.mockResolvedValueOnce({ status: "FAILED" });
+    payoutSubmit.mockResolvedValueOnce({ status: "UNKNOWN" });
+    const first = await postWithdrawal(user, "100000", "failed-then-new-a");
+    expect(first.body.status).toBe("FAILED");
+    const second = await postWithdrawal(user, "100000", "failed-then-new-b");
+    expect(second.response.status).toBe(201);
+    expect(second.body.status).toBe("UNKNOWN");
+    expect(
+      await db.query("SELECT id FROM withdrawals WHERE user_id=$1", [user]),
+    ).toHaveLength(2);
+    await assertFinancialInvariants(user);
+  });
+  it("serializes concurrent requests against the IRR cooldown", async () => {
+    const user = "33333333-3333-4333-8333-333333333341";
+    await seedWallet(user, "300000");
+    const results = await Promise.all([
+      postWithdrawal(user, "100000", "cooldown-race-a"),
+      postWithdrawal(user, "100000", "cooldown-race-b"),
+    ]);
+    expect(results.map((result) => result.response.status).sort()).toEqual([
+      201, 429,
+    ]);
+    expect(
+      results.find((result) => result.response.status === 429)?.body.code,
+    ).toBe("WITHDRAWAL_COOLDOWN_ACTIVE");
+    expect(
+      await db.query("SELECT id FROM withdrawals WHERE user_id=$1", [user]),
+    ).toHaveLength(1);
+    expect(payoutSubmit).toHaveBeenCalledTimes(1);
     await assertFinancialInvariants(user);
   });
   it("creates one withdrawal for concurrent identical idempotency requests", async () => {
@@ -458,11 +911,32 @@ describe("financial integration (real PostgreSQL)", () => {
     ).toHaveLength(1);
     await assertFinancialInvariants(user);
   });
-  it("processes duplicate signed payout webhooks without double settlement", async () => {
+  it("replays a withdrawal with the same idempotency key without a second payout", async () => {
+    const user = "22222222-2222-4222-8222-222222222227";
+    await seedWallet(user, "300000");
+    payoutSubmit.mockResolvedValue({ status: "UNKNOWN" });
+    const first = await postWithdrawal(user, "100000", "withdrawal-replay");
+    const replay = await postWithdrawal(user, "100000", "withdrawal-replay");
+    expect(first.response.status).toBe(201);
+    expect(replay.response.status).toBe(201);
+    expect(replay.body).toEqual(first.body);
+    expect(
+      await db.query("SELECT id FROM withdrawals WHERE user_id=$1", [user]),
+    ).toHaveLength(1);
+    expect(payoutSubmit).toHaveBeenCalledTimes(1);
+    expect(
+      await db.query(
+        "SELECT id FROM ledger_entries WHERE reference_type='WITHDRAWAL_RESERVE'",
+      ),
+    ).toHaveLength(2);
+    await assertFinancialInvariants(user);
+  });
+  it("settles an UNKNOWN withdrawal from a webhook and ignores its duplicate", async () => {
     const user = "44444444-4444-4444-8444-444444444447";
     await seedWallet(user, "200000");
-    payoutSubmit.mockResolvedValue({ status: "PROCESSING" });
+    payoutSubmit.mockResolvedValue({ status: "UNKNOWN" });
     const created = await postWithdrawal(user, "100000", "webhook-withdrawal");
+    expect(created.body.status).toBe("UNKNOWN");
     const event = {
       event: "transfer.updated",
       eventId: "integration-event-1",
@@ -471,18 +945,8 @@ describe("financial integration (real PostgreSQL)", () => {
       amount: "100000",
       currency: "IRR",
     };
-    const rawBody = Buffer.from(JSON.stringify(event));
-    const signature = createHmac("sha256", process.env.WEBHOOK_SECRET!)
-      .update(rawBody)
-      .digest("hex");
-    const webhook = new PayoutWebhookController(
-      new WebhookSignatureService(),
-      new IdempotencyService(db),
-      withdrawal,
-    );
-    const request = { rawBody } as RawBodyRequest<Request>;
-    await webhook.payout(request, signature, event.eventId);
-    await webhook.payout(request, signature, event.eventId);
+    await sendPayoutWebhook(event);
+    await sendPayoutWebhook(event);
     expect(
       (
         await db.query(
@@ -519,6 +983,9 @@ describe("financial integration (real PostgreSQL)", () => {
     )[0];
     expect(row.available_balance).toBe("200000.000000");
     expect(row.reserved_balance).toBe("0.000000");
+    const next = await postWithdrawal(user, "100000", "after-returned");
+    expect(next.response.status).toBe(201);
+    expect(next.body.status).toBe("SUCCEEDED");
     await assertFinancialInvariants(user);
   });
   it("credits IRR once and records exactly two balanced ADJUSTMENT entries", async () => {
@@ -732,6 +1199,35 @@ describe("financial integration (real PostgreSQL)", () => {
       [user],
     );
     expect(entries[0].count).toBe(0);
+  });
+  it("does not change withdrawal balances or call payout when reserve ledger insertion fails", async () => {
+    const user = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeef";
+    await seedWallet(user, "200000");
+    await db.query(`
+      CREATE FUNCTION fail_withdrawal_reserve_entry() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN RAISE EXCEPTION 'injected withdrawal ledger failure'; END $$;
+      CREATE TRIGGER fail_withdrawal_reserve_entry BEFORE INSERT ON ledger_entries
+      FOR EACH ROW WHEN (NEW.reference_type = 'WITHDRAWAL_RESERVE')
+      EXECUTE FUNCTION fail_withdrawal_reserve_entry();
+    `);
+    try {
+      const result = await postWithdrawal(
+        user,
+        "100000",
+        "withdrawal-rollback",
+      );
+      expect(result.response.status).toBe(500);
+    } finally {
+      await db.query(`
+        DROP TRIGGER IF EXISTS fail_withdrawal_reserve_entry ON ledger_entries;
+        DROP FUNCTION IF EXISTS fail_withdrawal_reserve_entry();
+      `);
+    }
+    expect(
+      await db.query("SELECT id FROM withdrawals WHERE user_id=$1", [user]),
+    ).toHaveLength(0);
+    expect(payoutSubmit).not.toHaveBeenCalled();
+    await assertFinancialInvariants(user);
   });
   it("does not create a separate adjustments table", async () => {
     const tables = await db.query(

@@ -1,17 +1,34 @@
-# ADR 002: Modular monolith
+# ADR 002: انتخاب معماری Modular Monolith
 
-## Context
-The wallet needs consistent financial transactions across domains and a simple deployment.
+## مسئله (Context)
 
-## Options considered
-- Separate microservices.
-- One application with explicit NestJS modules.
+در سیستم کیف پول، عملیات مالی مختلفی مثل پرداخت، برداشت و ثبت تراکنش‌های Ledger به هم وابسته هستن.
 
-## Decision
-Use a NestJS modular monolith.
+برای اینکه بتونم این عملیات رو به‌صورت اتمیک انجام بدم و در عین حال پیچیدگی استقرار و نگهداری سیستم رو بالا نبرم، باید معماری مناسبی انتخاب می‌کردم.
 
-## Reasons
-It permits database atomicity across payment, wallet, and ledger operations while keeping deployment and operations small.
+## راهکارهای بررسی‌شده (Options Considered)
 
-## Trade-offs
-Modules share one process and database and cannot be deployed independently.
+دو رویکرد رو بررسی کردم:
+
+- استفاده از معماری Microservices و جدا کردن بخش‌های مختلف سیستم به سرویس‌های مستقل.
+- استفاده از یک اپلیکیشن واحد با ماژول‌های مشخص و مستقل در NestJS.
+
+## تصمیم نهایی (Decision)
+
+تصمیم گرفتم از معماری Modular Monolith استفاده کنم.
+
+یعنی کل سیستم در قالب یک اپلیکیشن اجرا می‌شه، اما بخش‌های مختلف مثل Wallet، Payment و Ledger در ماژول‌های جداگانه با مسئولیت‌های مشخص قرار می‌گیرن.
+
+## دلایل انتخاب (Reasons)
+
+مهم‌ترین دلیل انتخاب این معماری، نیاز به حفظ یکپارچگی عملیات مالیه.
+
+با این روش می‌تونم عملیات مربوط به پرداخت، کیف پول و ثبت Ledger رو در یک Database Transaction انجام بدم و مطمئن باشم که یا همه تغییرات با هم ثبت می‌شن یا هیچ‌کدوم اعمال نمی‌شن.
+
+از طرف دیگه، استقرار و نگهداری سیستم ساده‌تره و فعلاً نیازی به مدیریت چند سرویس مستقل ندارم.
+
+## محدودیت‌ها و هزینه‌ها (Trade-offs)
+
+در این معماری، تمام ماژول‌ها در یک Process اجرا می‌شن و از یک Database مشترک استفاده می‌کنن.
+
+بنابراین ماژول‌ها به‌صورت مستقل قابل Deploy یا Scale نیستن و اگر در آینده نیاز به مقیاس‌پذیری یا استقرار مستقل بخش خاصی داشته باشیم، ممکنه لازم باشه بخشی از سیستم رو به یک سرویس جداگانه تبدیل کنیم.

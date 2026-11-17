@@ -1,5 +1,6 @@
 import { Injectable } from "@nestjs/common";
 import { EntityManager } from "typeorm";
+import { queryRows } from "../database/query-rows";
 export type Entry = {
   account: string;
   userId?: string | null;
@@ -36,7 +37,9 @@ export class LedgerService {
       [...totals.values()].some((t) => t.debit !== t.credit)
     )
       throw new Error("Unbalanced ledger transaction");
-    const txId = (await m.query("SELECT gen_random_uuid() id"))[0].id;
+    const txId = (
+      await queryRows<{ id: string }>(m, "SELECT gen_random_uuid() id")
+    )[0].id;
     for (const e of entries)
       await m.query(
         `INSERT INTO ledger_entries(transaction_id,account_code,related_user_id,reference_type,reference_id,amount,currency,entry_type,created_by_type,created_by_id,description) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,

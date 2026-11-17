@@ -1,4 +1,5 @@
 import { Injectable } from "@nestjs/common";
+import { ConfigService } from "@nestjs/config";
 import { DataSource } from "typeorm";
 import { WalletService } from "../wallet/wallet.service";
 import { LedgerService } from "../ledger/ledger.service";
@@ -6,7 +7,19 @@ import { PayoutAdapter } from "../integrations/payout.adapter";
 import { IdempotencyService } from "../idempotency/idempotency.service";
 import { amount, normalizeAmount, toUnits } from "../common/money";
 import { ApiError } from "../common/errors";
+import { queryRows } from "../database/query-rows";
 const qualifying = ["PENDING", "PROCESSING", "UNKNOWN", "SUCCEEDED"];
+type WithdrawalRow = {
+  id: string;
+  user_id: string;
+  amount: string;
+  currency: string;
+  destination: string;
+  status: string;
+  provider_request_id: string;
+  created_at: Date;
+  updated_at: Date;
+};
 @Injectable()
 export class WithdrawalService {
   constructor(
@@ -15,6 +28,7 @@ export class WithdrawalService {
     private ledger: LedgerService,
     private payout: PayoutAdapter,
     private idem: IdempotencyService,
+    private config: ConfigService,
   ) {}
   create(dto: any, key?: string) {
     return this.idem.run("POST:/withdrawals", key, dto, async () => {
@@ -23,18 +37,56 @@ export class WithdrawalService {
         throw new ApiError("UNSUPPORTED_WITHDRAWAL_CURRENCY", 422);
       if (toUnits(value) < 100000n * 1_000_000n)
         throw new ApiError("BELOW_MINIMUM", 422);
+      const cooldownMinutes = this.cooldownMinutes();
+      const dailyLimit = this.dailyWithdrawalLimit();
       const id = require("node:crypto").randomUUID();
       const providerId = require("node:crypto").randomUUID();
       await this.db.transaction(async (m) => {
         const w = await this.wallets.ensure(m, dto.userId, "IRR");
+        if (dto.currency === "IRR" && cooldownMinutes > 0) {
+          const recent = await queryRows<{ id: string }>(
+            m,
+            `SELECT id FROM withdrawals WHERE user_id=$1 AND currency='IRR' AND status=ANY($2) AND created_at > statement_timestamp() - ($3::int * interval '1 minute') LIMIT 1`,
+            [
+              dto.userId,
+              ["PENDING", "PROCESSING", "UNKNOWN", "SUCCEEDED"],
+              cooldownMinutes,
+            ],
+          );
+          if (recent.length)
+            throw new ApiError("WITHDRAWAL_COOLDOWN_ACTIVE", 429);
+        }
         if (toUnits(w.available_balance) < toUnits(value))
           throw new ApiError("INSUFFICIENT_FUNDS", 422);
-        const rows = await m.query(
-          `SELECT COALESCE(sum(amount),0)::text total FROM withdrawals WHERE user_id=$1 AND currency='IRR' AND status=ANY($2) AND created_at >= (date_trunc('day',now() AT TIME ZONE 'Asia/Tehran') AT TIME ZONE 'Asia/Tehran') AND created_at < ((date_trunc('day',now() AT TIME ZONE 'Asia/Tehran')+interval '1 day') AT TIME ZONE 'Asia/Tehran')`,
-          [dto.userId, qualifying],
+        const rows = await queryRows<{ total: string }>(
+          m,
+          `SELECT COALESCE(sum(amount),0)::text total FROM withdrawals WHERE user_id=$1 AND currency='IRR' AND status=ANY($2) AND created_at >= (date_trunc('day',now() AT TIME ZONE $3) AT TIME ZONE $3) AND created_at < ((date_trunc('day',now() AT TIME ZONE $3)+interval '1 day') AT TIME ZONE $3)`,
+          [
+            dto.userId,
+            qualifying,
+            this.config.get<string>("BUSINESS_TIMEZONE", "UTC"),
+          ],
         );
-        if (toUnits(rows[0].total) + toUnits(value) > 200000000n * 1_000_000n)
-          throw new ApiError("DAILY_LIMIT_EXCEEDED", 422);
+        const alreadyWithdrawn = toUnits(rows[0].total);
+        const requested = toUnits(value);
+        if (alreadyWithdrawn + requested > dailyLimit) {
+          const remaining =
+            alreadyWithdrawn >= dailyLimit ? 0n : dailyLimit - alreadyWithdrawn;
+          throw new ApiError(
+            "DAILY_WITHDRAWAL_LIMIT_EXCEEDED",
+            422,
+            "Daily withdrawal limit exceeded",
+            {
+              dailyLimit: (dailyLimit / 1_000_000n).toString(),
+              amountAlreadyWithdrawn: (
+                alreadyWithdrawn / 1_000_000n
+              ).toString(),
+              remainingDailyAllowance: (remaining / 1_000_000n).toString(),
+              requestedAmount: (requested / 1_000_000n).toString(),
+              currency: "IRR",
+            },
+          );
+        }
         await m.query(
           `INSERT INTO withdrawals(id,user_id,amount,currency,destination,status,provider_request_id) VALUES($1,$2,$3,'IRR',$4,'PENDING',$5)`,
           [id, dto.userId, value, dto.destination, providerId],
@@ -69,10 +121,28 @@ export class WithdrawalService {
       return this.process(id);
     });
   }
+  private cooldownMinutes() {
+    const value = Number(process.env.WITHDRAWAL_COOLDOWN_MINUTES ?? 30);
+    if (!Number.isSafeInteger(value) || value < 0)
+      throw new ApiError("INVALID_WITHDRAWAL_COOLDOWN_CONFIGURATION", 500);
+    return value;
+  }
+  private dailyWithdrawalLimit() {
+    const value = process.env.DAILY_WITHDRAWAL_LIMIT;
+    if (!value || !/^[1-9]\d*$/.test(value))
+      throw new ApiError("INVALID_DAILY_WITHDRAWAL_LIMIT_CONFIGURATION", 500);
+    try {
+      return BigInt(value) * 1_000_000n;
+    } catch {
+      throw new ApiError("INVALID_DAILY_WITHDRAWAL_LIMIT_CONFIGURATION", 500);
+    }
+  }
   async get(id: string) {
-    const r = await this.db.query("SELECT * FROM withdrawals WHERE id=$1", [
-      id,
-    ]);
+    const r = await queryRows<WithdrawalRow>(
+      this.db,
+      "SELECT * FROM withdrawals WHERE id=$1",
+      [id],
+    );
     if (!r[0]) throw new ApiError("NOT_FOUND", 404);
     return r[0];
   }
@@ -120,14 +190,11 @@ export class WithdrawalService {
     });
   }
   async process(id: string) {
-    const claimedResult = await this.db.query(
+    const claimed = await queryRows<WithdrawalRow>(
+      this.db,
       `UPDATE withdrawals SET status='PROCESSING',updated_at=now() WHERE id=$1 AND (status IN ('PENDING','UNKNOWN') OR (status='PROCESSING' AND updated_at < now()-interval '2 minutes')) RETURNING *`,
       [id],
     );
-    const claimed = Array.isArray(claimedResult[0])
-      ? claimedResult[0]
-      : claimedResult;
-
     if (!claimed.length) return this.get(id);
     const w = claimed[0];
     try {
@@ -160,7 +227,11 @@ export class WithdrawalService {
   }
   async verify(id: string) {
     const w = (
-      await this.db.query("SELECT * FROM withdrawals WHERE id=$1", [id])
+      await queryRows<WithdrawalRow>(
+        this.db,
+        "SELECT * FROM withdrawals WHERE id=$1",
+        [id],
+      )
     )[0];
     if (!w) throw new ApiError("NOT_FOUND", 404);
     try {
@@ -190,7 +261,8 @@ export class WithdrawalService {
     }
   }
   async recover() {
-    const rows = await this.db.query(
+    const rows = await queryRows<{ id: string }>(
+      this.db,
       `SELECT id FROM withdrawals WHERE status='PENDING' OR (status='PROCESSING' AND updated_at < now()-interval '2 minutes') ORDER BY created_at LIMIT 100`,
     );
     const results = [];
@@ -206,7 +278,8 @@ export class WithdrawalService {
     )
       throw new ApiError("INVALID_PAYOUT_WEBHOOK", 400);
     const withdrawal = (
-      await this.db.query(
+      await queryRows<WithdrawalRow>(
+        this.db,
         "SELECT * FROM withdrawals WHERE provider_request_id=$1",
         [event.requestId],
       )
@@ -239,8 +312,13 @@ export class WithdrawalService {
   private async returned(id: string) {
     return this.db.transaction(async (m) => {
       const withdrawal = (
-        await m.query("SELECT * FROM withdrawals WHERE id=$1 FOR UPDATE", [id])
+        await queryRows<WithdrawalRow>(
+          m,
+          "SELECT * FROM withdrawals WHERE id=$1 FOR UPDATE",
+          [id],
+        )
       )[0];
+      if (!withdrawal) throw new ApiError("NOT_FOUND", 404);
       if (["FAILED", "RETURNED"].includes(withdrawal.status)) return withdrawal;
       if (withdrawal.status === "SUCCEEDED") {
         const wallet = await this.wallets.ensure(
@@ -307,7 +385,8 @@ export class WithdrawalService {
         });
       }
       return (
-        await m.query(
+        await queryRows<WithdrawalRow>(
+          m,
           "UPDATE withdrawals SET status='RETURNED',updated_at=now() WHERE id=$1 RETURNING *",
           [id],
         )
@@ -317,8 +396,13 @@ export class WithdrawalService {
   private async finish(id: string, success: boolean) {
     return this.db.transaction(async (m) => {
       const w = (
-        await m.query("SELECT * FROM withdrawals WHERE id=$1 FOR UPDATE", [id])
+        await queryRows<WithdrawalRow>(
+          m,
+          "SELECT * FROM withdrawals WHERE id=$1 FOR UPDATE",
+          [id],
+        )
       )[0];
+      if (!w) throw new ApiError("NOT_FOUND", 404);
       if (["FAILED", "SUCCEEDED", "RETURNED"].includes(w.status)) return w;
       const wallet = await this.wallets.ensure(m, w.user_id, w.currency);
       if (success) {
@@ -376,7 +460,8 @@ export class WithdrawalService {
         });
       }
       return (
-        await m.query(
+        await queryRows<WithdrawalRow>(
+          m,
           `UPDATE withdrawals SET status=$2,updated_at=now() WHERE id=$1 RETURNING *`,
           [id, success ? "SUCCEEDED" : "FAILED"],
         )

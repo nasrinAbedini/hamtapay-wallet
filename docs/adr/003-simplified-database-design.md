@@ -1,17 +1,36 @@
-# ADR 003: Simplified database design
+# ADR 003: ساده‌سازی طراحی دیتابیس (Simplified Database Design)
 
-## Context
-Avoid redundant tables while preserving wallet deposits, daily limit computation, and manual adjustment history.
+## مسئله (Context)
 
-## Options considered
-- Add deposits, adjustment, accounts, daily aggregate, and outbox tables.
-- Store deposits in payments, adjustments directly in ledger, and compute daily use from withdrawals.
+هدفم این بود که طراحی دیتابیس تا حد ممکن ساده باشه و از ایجاد جدول‌های اضافی و نگهداری اطلاعات تکراری جلوگیری کنم؛ در عین حال، نیازهای اصلی سیستم مثل ثبت واریزها، محاسبه سقف برداشت روزانه و نگهداری تاریخچه اصلاحات دستی موجودی هم پوشش داده بشه.
 
-## Decision
-Use only wallets, ledger_entries, payments, withdrawals, and idempotency_keys.
+## راهکارهای بررسی‌شده (Options Considered)
 
-## Reasons
-This matches the requested scope and avoids duplicate state.
+دو رویکرد رو بررسی کردم:
 
-## Trade-offs
-Daily usage queries can become expensive at scale. The five-table design has no outbox and relies on operational recovery for committed pending payouts.
+- ایجاد جدول‌های جداگانه برای واریزها، اصلاح موجودی، حساب‌ها، مجموع برداشت روزانه و Outbox.
+- استفاده از جدول Payments برای ثبت واریزها، ثبت اصلاحات مستقیم در Ledger و محاسبه میزان برداشت روزانه از روی اطلاعات جدول Withdrawals.
+
+## تصمیم نهایی (Decision)
+
+تصمیم گرفتم طراحی دیتابیس رو به پنج جدول اصلی محدود کنم:
+
+- `wallets`: نگهداری موجودی کیف پول‌ها
+- `ledger_entries`: ثبت تمام تراکنش‌های مالی
+- `payments`: مدیریت پرداخت‌ها و واریزها
+- `withdrawals`: مدیریت درخواست‌های برداشت
+- `idempotency_keys`: جلوگیری از اجرای تکراری درخواست‌ها
+
+با این طراحی، برای هر نوع عملیات جدول جداگانه‌ای ایجاد نمی‌کنم و تا جای ممکن از اطلاعات موجود استفاده می‌کنم.
+
+## دلایل انتخاب (Reasons)
+
+این طراحی با محدوده نیازمندی‌های پروژه متناسبه و از نگهداری اطلاعات تکراری و ایجاد پیچیدگی غیرضروری جلوگیری می‌کنه.
+
+همچنین اطلاعات مالی در Ledger به‌صورت متمرکز ثبت می‌شن و می‌تونم برای محاسبه برداشت‌های روزانه از اطلاعات موجود در Withdrawals استفاده کنم.
+
+## محدودیت‌ها و هزینه‌ها (Trade-offs)
+
+با افزایش تعداد برداشت‌ها، محاسبه مجموع برداشت روزانه از روی جدول Withdrawals می‌تونه هزینه‌بر بشه و در مقیاس بالا نیاز به بهینه‌سازی یا استفاده از Aggregateهای از پیش محاسبه‌شده داشته باشه.
+
+از طرف دیگه، در این طراحی جدول Outbox نداریم؛ بنابراین برای پرداخت‌هایی که درخواستشون ثبت شده اما نتیجه نهایی از سرویس پرداخت دریافت نشده، به مکانیزم‌های عملیاتی برای پیگیری و بازیابی نیاز داریم.

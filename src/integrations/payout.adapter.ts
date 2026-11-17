@@ -47,9 +47,11 @@ export class PayoutAdapter {
         unknown
       > | null;
       if (!response.ok) {
+        const outcomeIsUnknown =
+          response.status === 408 || response.status >= 500;
         throw new ApiError(
-          response.status >= 500 ? "PAYOUT_UNKNOWN" : "PAYOUT_ERROR",
-          response.status >= 500 ? 504 : 502,
+          outcomeIsUnknown ? "PAYOUT_UNKNOWN" : "PAYOUT_ERROR",
+          outcomeIsUnknown ? 504 : 502,
           typeof data?.error === "string"
             ? data.error
             : "Payout request failed",

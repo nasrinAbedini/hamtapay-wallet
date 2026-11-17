@@ -1,18 +1,42 @@
-# ADR 001: Double-entry ledger
+# ADR 001: استفاده از دفتر کل دوطرفه (Double-entry Ledger)
 
-## Context
-Wallet balances must be auditable and every financial movement must balance by currency.
+## مسئله (Context)
 
-## Options considered
-- Store only current balances.
-- Store a one-sided activity log.
-- Store immutable debit and credit entries.
+برای اینکه بتونیم تمام جابه‌جایی‌های مالی کیف پول رو به‌صورت دقیق پیگیری و حسابرسی کنیم، باید هر تراکنش مالی قابل ردیابی باشه و مجموع بدهکار و بستانکار اون به ازای هر ارز با هم برابر باشه.
 
-## Decision
-Use immutable double-entry rows grouped by `transaction_id`, with logical account codes and a consistent liability accounting convention.
+## راهکارهای بررسی‌شده (Options Considered)
 
-## Reasons
-This makes movements traceable, enables balance checks, and permits correction through compensating entries.
+سه روش رو بررسی کردم:
 
-## Trade-offs
-Every business operation must construct balanced entries. Application validation checks balance before commit; PostgreSQL blocks ledger updates and deletes, but group balance is not enforced by a deferred database trigger.
+- فقط موجودی فعلی کیف پول رو ذخیره کنیم.
+- یک تاریخچه از فعالیت‌های مالی داشته باشیم، بدون ثبت دوطرفه.
+- برای هر تراکنش، سند بدهکار و بستانکار ثبت کنیم.
+
+## تصمیم نهایی (Decision)
+
+تصمیم گرفتم از مدل دفتر کل دوطرفه استفاده کنم.
+
+یعنی هر حرکت مالی به‌صورت دو رکورد مستقل، یکی بدهکار (Debit) و دیگری بستانکار (Credit) ثبت می‌شه و هر دو با یک `transaction_id` به هم مرتبط هستن.
+
+همچنین برای حساب‌ها کد مشخصی در نظر می‌گیرم و یک قرارداد حسابداری ثابت برای ثبت بدهی‌ها و تعهدات مالی دارم.
+
+رکوردهای Ledger هم غیرقابل تغییر هستن؛ یعنی بعد از ثبت، امکان ویرایش یا حذف مستقیم اون‌ها وجود نداره.
+
+## دلایل انتخاب (Reasons)
+
+این روش چند مزیت مهم داره:
+
+- تمام جابه‌جایی‌های مالی قابل ردیابی و حسابرسی هستن.
+- می‌تونیم صحت ثبت تراکنش‌ها رو با بررسی برابر بودن بدهکار و بستانکار کنترل کنیم.
+- اگر اشتباهی در یک تراکنش اتفاق بیفته، به‌جای تغییر یا حذف سابقه قبلی، با ثبت یک تراکنش اصلاحی (Compensating Entry) اون رو جبران می‌کنیم.
+- تاریخچه مالی قابل اعتماد باقی می‌مونه.
+
+## محدودیت‌ها و هزینه‌ها (Trade-offs)
+
+استفاده از این مدل پیچیدگی بیشتری به عملیات مالی اضافه می‌کنه؛ چون هر عملیات باید سندهای بدهکار و بستانکار متوازن داشته باشه.
+
+در سطح برنامه، قبل از Commit شدن تراکنش، توازن سندها رو بررسی می‌کنم.
+
+در PostgreSQL هم با محدود کردن دسترسی‌ها و استفاده از Trigger، جلوی ویرایش و حذف رکوردهای Ledger رو می‌گیرم.
+
+البته در طراحی فعلی، متوازن بودن مجموع رکوردهای یک `transaction_id` با یک Trigger از نوع Deferred در دیتابیس enforce نشده و کنترل این موضوع در لایه برنامه انجام می‌شه.
