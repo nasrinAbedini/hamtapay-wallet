@@ -108,14 +108,16 @@ export class PaymentService {
       )
     )[0];
     if (!p) throw new ApiError("INVALID_CALLBACK", 400);
+    if (body.amount !== undefined) {
+      if (
+        typeof body.amount !== "string" ||
+        normalizeAmount(this.psp.callbackAmountToToman(body.amount)) !==
+          normalizeAmount(p.amount)
+      )
+        throw new ApiError("PAYMENT_MISMATCH", 422);
+    }
     if (p.status === "SUCCEEDED" || p.status === "FAILED")
       return { status: p.status };
-    if (
-      body.amount !== undefined &&
-      (typeof body.amount !== "string" ||
-        normalizeAmount(body.amount) !== normalizeAmount(p.amount))
-    )
-      throw new ApiError("PAYMENT_MISMATCH", 422);
     return this.confirm(p);
   }
 
@@ -146,9 +148,10 @@ export class PaymentService {
     if (!success && !definitivelyFailed)
       throw new ApiError("PSP_VERIFICATION_PENDING", 503);
     if (
-      success &&
-      (typeof verified.amount !== "string" ||
-        normalizeAmount(verified.amount) !== normalizeAmount(p.amount))
+      (verified.amount !== undefined &&
+        (typeof verified.amount !== "string" ||
+          normalizeAmount(verified.amount) !== normalizeAmount(p.amount))) ||
+      (success && typeof verified.amount !== "string")
     )
       throw new ApiError("PAYMENT_MISMATCH", 422);
     if (success && typeof verified.refId !== "string")

@@ -29,6 +29,20 @@ export function normalizeAmount(value: string): string {
   const [whole, fraction = ""] = value.split(".");
   return `${whole}.${fraction.padEnd(6, "0")}`;
 }
+export function tomanToRial(value: string): string {
+  return (parseIntegerAmount(value, "Toman") * 10n).toString();
+}
+export function rialToToman(value: string): string {
+  const rial = parseIntegerAmount(value, "Rial");
+  if (rial % 10n !== 0n)
+    throw new RangeError("Rial amount cannot be represented as whole Toman");
+  return (rial / 10n).toString();
+}
+function parseIntegerAmount(value: string, unit: string): bigint {
+  if (typeof value !== "string" || !/^(0|[1-9]\d*)$/.test(value))
+    throw new TypeError(`${unit} amount must be a non-negative integer string`);
+  return BigInt(value);
+}
 export function hashRequest(value: unknown): string {
   return require("node:crypto")
     .createHash("sha256")

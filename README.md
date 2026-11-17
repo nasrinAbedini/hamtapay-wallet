@@ -30,6 +30,7 @@ Key design decisions:
 - Database transactions and row-level locking for financial consistency.
 - Idempotency keys to prevent duplicate operations.
 - Decimal strings in APIs and `NUMERIC(20,6)` for monetary values.
+- API, wallet, payment, withdrawal, and ledger amounts are denominated in Toman; provider boundary amounts are Rial (10 Rial per Toman).
 - External provider calls are performed outside database transactions.
 - Unknown payout outcomes keep funds reserved until verified.
 

@@ -16,12 +16,14 @@ import { LedgerService } from "../src/ledger/ledger.service";
 import { IdempotencyService } from "../src/idempotency/idempotency.service";
 import { WithdrawalService } from "../src/withdrawal/withdrawal.service";
 import { PayoutAdapter } from "../src/integrations/payout.adapter";
+import { PspAdapter } from "../src/integrations/psp.adapter";
 import { WithdrawalController } from "../src/withdrawal/withdrawal.controller";
 import { ApiExceptionFilter } from "../src/common/exception.filter";
 import { PayoutWebhookController } from "../src/webhooks/payout-webhook.controller";
 import { WebhookSignatureService } from "../src/webhooks/webhook-signature.service";
 import { toUnits } from "../src/common/money";
 import { validateEnvironment } from "../src/config/environment";
+import { PaymentService } from "../src/payment/payment.service";
 
 function envFile(): Record<string, string> {
   const path = resolve(process.cwd(), ".env");
@@ -67,6 +69,7 @@ describe("financial integration (real PostgreSQL)", () => {
   let db: DataSource;
   let wallet: WalletService;
   let withdrawal: WithdrawalService;
+  let payment: PaymentService;
   let app: INestApplication;
   let apiBase: string;
   let originalCooldown: string | undefined;
@@ -76,8 +79,12 @@ describe("financial integration (real PostgreSQL)", () => {
   let payouts: {
     submit: (p: any) => Promise<any>;
     status: (id: string) => Promise<any>;
+    webhookAmountToToman: (amount: string) => string;
   };
   let payoutSubmit: jest.Mock;
+  let pspCreate: jest.Mock;
+  let pspPaymentStatus: jest.Mock;
+  let pspVerify: jest.Mock;
   beforeAll(async () => {
     db = new DataSource({
       type: "postgres",
@@ -117,6 +124,8 @@ describe("financial integration (real PostgreSQL)", () => {
     payouts = {
       submit: (payload) => payoutSubmit(payload),
       status: async () => ({ status: "UNKNOWN" }),
+      webhookAmountToToman: (amount) =>
+        new PayoutAdapter().webhookAmountToToman(amount),
     };
     withdrawal = new WithdrawalService(
       db,
@@ -125,6 +134,36 @@ describe("financial integration (real PostgreSQL)", () => {
       payouts as unknown as PayoutAdapter,
       new IdempotencyService(db),
       withdrawalConfig,
+    );
+    pspCreate = jest.fn(async () => ({
+      code: 100,
+      token: "integration-psp-token",
+      paymentUrl: "https://example.test/payment",
+    }));
+    pspPaymentStatus = jest.fn(async () => ({
+      token: "integration-psp-token",
+      orderId: "unused",
+      amount: "100000",
+      status: "PAID",
+    }));
+    pspVerify = jest.fn(async () => ({
+      code: 100,
+      status: "OK",
+      amount: "100000",
+      refId: "integration-psp-ref",
+    }));
+    payment = new PaymentService(
+      db,
+      wallet,
+      new LedgerService(),
+      {
+        create: pspCreate,
+        paymentStatus: pspPaymentStatus,
+        verify: pspVerify,
+        callbackAmountToToman: (amount: string) =>
+          new PspAdapter().callbackAmountToToman(amount),
+      } as unknown as PspAdapter,
+      new IdempotencyService(db),
     );
     const moduleRef = await Test.createTestingModule({
       controllers: [WithdrawalController],
@@ -147,6 +186,26 @@ describe("financial integration (real PostgreSQL)", () => {
   beforeEach(async () => {
     payoutSubmit.mockReset();
     payoutSubmit.mockResolvedValue({ status: "UNKNOWN" });
+    pspCreate.mockReset();
+    pspCreate.mockResolvedValue({
+      code: 100,
+      token: "integration-psp-token",
+      paymentUrl: "https://example.test/payment",
+    });
+    pspPaymentStatus.mockReset();
+    pspPaymentStatus.mockResolvedValue({
+      token: "integration-psp-token",
+      orderId: "unused",
+      amount: "100000",
+      status: "PAID",
+    });
+    pspVerify.mockReset();
+    pspVerify.mockResolvedValue({
+      code: 100,
+      status: "OK",
+      amount: "100000",
+      refId: "integration-psp-ref",
+    });
     withdrawalConfig?.set("BUSINESS_TIMEZONE", "UTC");
     await db.query(
       "TRUNCATE idempotency_keys,withdrawals,payments,ledger_entries,wallets CASCADE",
@@ -308,6 +367,88 @@ describe("financial integration (real PostgreSQL)", () => {
     expect(result.available_balance).toBe("0.000000");
     expect(result.reserved_balance).toBe("0.000000");
   });
+  it("stores deposit amounts in Toman and credits Toman after Rial verification", async () => {
+    const user = "22222222-2222-4222-8222-222222222230";
+    await seedWallet(user, "0");
+    const created = await payment.create(
+      { userId: user, amount: "100000", currency: "IRR" },
+      "deposit-toman-storage",
+    );
+    expect(created.amount).toBe("100000");
+    expect(pspCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ amount: "100000" }),
+    );
+    const row = (
+      await db.query(
+        "SELECT id,order_id,amount::text FROM payments WHERE user_id=$1",
+        [user],
+      )
+    )[0];
+    pspPaymentStatus.mockResolvedValue({
+      token: "integration-psp-token",
+      orderId: row.order_id,
+      amount: "100000",
+      status: "PAID",
+    });
+    const result = await payment.callback({
+      token: "integration-psp-token",
+      orderId: row.order_id,
+      status: "OK",
+      amount: "1000000",
+    });
+    expect(row.amount).toBe("100000.000000");
+    expect(result.status).toBe("SUCCEEDED");
+    const walletRow = (
+      await db.query(
+        "SELECT available_balance::text available FROM wallets WHERE user_id=$1 AND currency='IRR'",
+        [user],
+      )
+    )[0];
+    expect(walletRow.available).toBe("100000.000000");
+    await assertFinancialInvariants(user);
+  });
+  it("does not credit a deposit when the provider reports a different Rial amount", async () => {
+    const user = "22222222-2222-4222-8222-222222222231";
+    await seedWallet(user, "0");
+    await payment.create(
+      { userId: user, amount: "100000", currency: "IRR" },
+      "deposit-mismatched-provider-amount",
+    );
+    const row = (
+      await db.query("SELECT order_id FROM payments WHERE user_id=$1", [user])
+    )[0];
+    pspPaymentStatus.mockResolvedValue({
+      token: "integration-psp-token",
+      orderId: row.order_id,
+      amount: "90000",
+      status: "PAID",
+    });
+    await expect(
+      payment.callback({
+        token: "integration-psp-token",
+        orderId: row.order_id,
+        status: "OK",
+        amount: "1000000",
+      }),
+    ).rejects.toMatchObject({ response: { code: "PAYMENT_MISMATCH" } });
+    const walletRow = (
+      await db.query(
+        "SELECT available_balance::text available FROM wallets WHERE user_id=$1 AND currency='IRR'",
+        [user],
+      )
+    )[0];
+    expect(walletRow.available).toBe("0.000000");
+    expect(
+      await db.query("SELECT id FROM ledger_entries WHERE related_user_id=$1", [
+        user,
+      ]),
+    ).toHaveLength(0);
+    expect(
+      (
+        await db.query("SELECT status FROM payments WHERE user_id=$1", [user])
+      )[0].status,
+    ).toBe("PAYMENT_INITIATED");
+  });
   it("creates a successful IRR withdrawal and reserves funds", async () => {
     const user = "22222222-2222-4222-8222-222222222222";
     await seedWallet(user, "300000");
@@ -341,6 +482,17 @@ describe("financial integration (real PostgreSQL)", () => {
     expect(body.code).toBe("BELOW_MINIMUM");
     expect(await db.query("SELECT id FROM withdrawals")).toHaveLength(0);
     await assertFinancialInvariants(user);
+  });
+  it("accepts a withdrawal one Toman above the minimum", async () => {
+    const user = "33333333-3333-4333-8333-333333333334";
+    await seedWallet(user, "200000");
+    const { response, body } = await postWithdrawal(
+      user,
+      "100001",
+      "one-above-minimum",
+    );
+    expect(response.status).toBe(201);
+    expect(body.amount).toBe("100001.000000");
   });
   it("rejects insufficient funds without creating a withdrawal", async () => {
     const user = "33333333-3333-4333-8333-333333333334";
@@ -702,7 +854,7 @@ describe("financial integration (real PostgreSQL)", () => {
         url: "/payout/transfers",
         body: {
           requestId: body.provider_request_id,
-          amount: "100000",
+          amount: "1000000",
           currency: "IRR",
           type: "IBAN",
         },
@@ -937,14 +1089,44 @@ describe("financial integration (real PostgreSQL)", () => {
     payoutSubmit.mockResolvedValue({ status: "UNKNOWN" });
     const created = await postWithdrawal(user, "100000", "webhook-withdrawal");
     expect(created.body.status).toBe("UNKNOWN");
+    const ledgerBeforeMismatch = await db.query(
+      "SELECT count(*)::int count FROM ledger_entries WHERE related_user_id=$1",
+      [user],
+    );
     const event = {
       event: "transfer.updated",
       eventId: "integration-event-1",
       requestId: created.body.provider_request_id,
       status: "SUCCEEDED",
-      amount: "100000",
+      amount: "1000000",
       currency: "IRR",
     };
+    const invalidEvent = {
+      ...event,
+      eventId: "integration-event-mismatch",
+      amount: "900000",
+    };
+    await expect(sendPayoutWebhook(invalidEvent)).rejects.toMatchObject({
+      response: { code: "PAYOUT_WEBHOOK_MISMATCH" },
+    });
+    const walletBeforeValidEvent = (
+      await db.query(
+        "SELECT available_balance::text available,reserved_balance::text reserved FROM wallets WHERE user_id=$1",
+        [user],
+      )
+    )[0];
+    expect(walletBeforeValidEvent.available).toBe("100000.000000");
+    expect(walletBeforeValidEvent.reserved).toBe("100000.000000");
+    expect(
+      await db.query(
+        "SELECT id FROM ledger_entries WHERE reference_type='WITHDRAWAL_SETTLEMENT'",
+      ),
+    ).toHaveLength(0);
+    const ledgerAfterMismatch = await db.query(
+      "SELECT count(*)::int count FROM ledger_entries WHERE related_user_id=$1",
+      [user],
+    );
+    expect(ledgerAfterMismatch[0].count).toBe(ledgerBeforeMismatch[0].count);
     await sendPayoutWebhook(event);
     await sendPayoutWebhook(event);
     expect(
@@ -971,7 +1153,7 @@ describe("financial integration (real PostgreSQL)", () => {
       eventId: "evt-returned-1",
       requestId: created.body.provider_request_id,
       status: "RETURNED",
-      amount: "100000",
+      amount: "1000000",
       currency: "IRR",
     });
     expect(returned.status).toBe("RETURNED");

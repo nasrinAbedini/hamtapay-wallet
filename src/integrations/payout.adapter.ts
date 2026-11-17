@@ -1,5 +1,6 @@
 import { Injectable } from "@nestjs/common";
 import { ApiError } from "../common/errors";
+import { rialToToman, tomanToRial } from "../common/money";
 
 export type PayoutResult = {
   requestId: string;
@@ -80,7 +81,7 @@ export class PayoutAdapter {
       requestId: p.requestId,
       type: "IBAN",
       destination: p.destination,
-      amount: p.amount,
+      amount: tomanToRial(p.amount),
       currency: p.currency,
     });
     return this.validate(result, p);
@@ -94,9 +95,23 @@ export class PayoutAdapter {
       true,
     );
     if (!result) return null;
-    if (result.requestId !== requestId || typeof result.status !== "string")
+    if (
+      result.requestId !== requestId ||
+      typeof result.status !== "string" ||
+      typeof result.amount !== "string" ||
+      typeof result.currency !== "string" ||
+      typeof result.destination !== "string"
+    )
       throw new ApiError("PAYOUT_INVALID_RESPONSE", 502);
-    return result as PayoutResult;
+    return this.toInternalAmount(result) as PayoutResult;
+  }
+
+  webhookAmountToToman(value: string): string {
+    try {
+      return rialToToman(value);
+    } catch {
+      throw new ApiError("PAYOUT_WEBHOOK_MISMATCH", 422);
+    }
   }
 
   private validate(
@@ -111,12 +126,24 @@ export class PayoutAdapter {
     if (
       !result ||
       result.requestId !== expected.requestId ||
-      result.amount !== expected.amount ||
       result.currency !== expected.currency ||
       result.destination !== expected.destination ||
       typeof result.status !== "string"
     )
       throw new ApiError("PAYOUT_INVALID_RESPONSE", 502);
-    return result as PayoutResult;
+    const internalAmount = this.toInternalAmount(result).amount;
+    if (internalAmount !== expected.amount)
+      throw new ApiError("PAYOUT_INVALID_RESPONSE", 502);
+    return { ...result, amount: internalAmount } as PayoutResult;
+  }
+
+  private toInternalAmount(result: Record<string, unknown>) {
+    if (typeof result.amount !== "string")
+      throw new ApiError("PAYOUT_INVALID_RESPONSE", 502);
+    try {
+      return { ...result, amount: rialToToman(result.amount) };
+    } catch {
+      throw new ApiError("PAYOUT_INVALID_RESPONSE", 502);
+    }
   }
 }

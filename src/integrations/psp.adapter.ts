@@ -1,5 +1,6 @@
 import { Injectable } from "@nestjs/common";
 import { ApiError } from "../common/errors";
+import { rialToToman, tomanToRial } from "../common/money";
 
 type ProviderJson = Record<string, unknown>;
 
@@ -60,25 +61,50 @@ export class PspAdapter {
     }
   }
 
-  create(payload: { orderId: string; amount: string; callbackUrl: string }) {
-    return this.request("/psp/payments", "POST", {
-      amount: payload.amount,
+  async create(payload: {
+    orderId: string;
+    amount: string;
+    callbackUrl: string;
+  }): Promise<ProviderJson> {
+    const result = (await this.request("/psp/payments", "POST", {
+      amount: tomanToRial(payload.amount),
       callbackUrl: payload.callbackUrl,
       orderId: payload.orderId,
-    }) as Promise<ProviderJson>;
+    })) as ProviderJson;
+    const internal = this.toInternalAmount(result);
+    if (internal.amount !== undefined && internal.amount !== payload.amount)
+      throw new ApiError("PSP_INVALID_RESPONSE", 502);
+    return internal;
   }
 
   verify(token: string) {
-    return this.request("/psp/verify", "POST", {
-      token,
-    }) as Promise<ProviderJson>;
+    return this.request("/psp/verify", "POST", { token }).then((result) =>
+      this.toInternalAmount(result as ProviderJson),
+    );
   }
 
   paymentStatus(token: string) {
     return this.request(
       `/psp/payments/${encodeURIComponent(token)}`,
       "GET",
-    ) as Promise<ProviderJson>;
+    ).then((result) => this.toInternalAmount(result as ProviderJson));
+  }
+
+  callbackAmountToToman(value: string) {
+    try {
+      return rialToToman(value);
+    } catch {
+      throw new ApiError("PAYMENT_MISMATCH", 422);
+    }
+  }
+
+  private toInternalAmount(result: ProviderJson): ProviderJson {
+    if (typeof result.amount !== "string") return result;
+    try {
+      return { ...result, amount: rialToToman(result.amount) };
+    } catch {
+      throw new ApiError("PSP_INVALID_RESPONSE", 502);
+    }
   }
 
   async settlement(date: string): Promise<string> {

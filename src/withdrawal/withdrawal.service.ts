@@ -287,9 +287,11 @@ export class WithdrawalService {
     if (!withdrawal) throw new ApiError("WITHDRAWAL_NOT_FOUND", 404);
     if (
       typeof event.amount !== "string" ||
-      normalizeAmount(event.amount) !== normalizeAmount(withdrawal.amount) ||
       event.currency !== withdrawal.currency
     )
+      throw new ApiError("PAYOUT_WEBHOOK_MISMATCH", 422);
+    const eventAmount = this.payout.webhookAmountToToman(event.amount);
+    if (normalizeAmount(eventAmount) !== normalizeAmount(withdrawal.amount))
       throw new ApiError("PAYOUT_WEBHOOK_MISMATCH", 422);
     switch (event.status.toUpperCase()) {
       case "ACCEPTED":
